@@ -1,0 +1,574 @@
+---
+title: "Classifying Tumour & Immune Cells in H&E Images"
+author: "*Client*: Shila Ghazanfar. *Consultant*: Imane Lattab."
+format: 
+  revealjs:
+    embed-resources: true
+    theme: moon
+    slide-number: true
+    scrollable: true
+bibliography: refs.bib
+---
+```{r setup, include=FALSE}
+# try and detach tensorflow
+
+library(tidyverse)
+library(dplyr)
+library(knitr)
+
+library(ggplot2)
+library(ggimage)
+library(viridis)
+library(plotly)
+
+library(EBImage)
+library(OpenImageR)
+library(grid)
+
+library(randomForest)
+library(caret)
+library(e1071)
+
+library(class)
+library(abind)
+library(tensorflow)
+library(keras3)
+
+# function to set seed
+set_all_seeds <- function(seed = 3888) {
+  # R seeds
+  seed = as.integer(seed)
+  set.seed(seed)
+  
+  # Python/TensorFlow/NumPy
+  tensorflow::tf$random$set_seed(seed)
+  tensorflow::tf$keras$utils$set_random_seed(seed)
+  reticulate::py_set_seed(seed)  # Additional Python-level seed
+  
+  # GPU/cuDNN deterministic behavior (slower but reproducible)
+  tensorflow::tf$config$experimental$enable_op_determinism()
+  
+  # Environment variables
+  Sys.setenv(PYTHONHASHSEED = as.character(seed))
+  Sys.setenv(CUDA_LAUNCH_BLOCKING = "1")  # For CUDA reproducibility
+}
+
+```
+
+```{r global_options, include=FALSE}
+# clean session for rendering
+knitr::opts_chunk$set(
+  cache = FALSE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+## Motivation - Breast Cancer {background-image="https://d2jx2rerrg6sh3.cloudfront.net/images/Article_Images/ImageForArticle_2145_16375579068259097.jpg" background-size="cover" background-opacity=0.1}
+
+```{r data, message=FALSE, results='hide'}
+set_all_seeds(3888)
+set.seed(3888)
+
+# read in both files 
+tumour_files = list.files("100/Invasive_Tumor/", full.names = TRUE) |> sample()
+immune_files = list.files("100/CD4+_T_Cells/", full.names = TRUE) |> sample()
+
+
+# TUMOUR CELLS
+# resize images
+tumour_imgs = sapply(tumour_files, EBImage::readImage, simplify = FALSE)
+tumour_imgs_resized = lapply(tumour_imgs, resize, w = 50, h = 50)
+
+# HEALTHY CELLS
+# resize
+immune_imgs = sapply(immune_files, EBImage::readImage, simplify = FALSE)
+immune_imgs_resized = lapply(immune_imgs, resize, w = 50, h = 50)
+```
+
+
+```{r img-matrix, echo=FALSE}
+set_all_seeds(3888)
+set.seed(3888)
+
+# image grids
+tumour_grid = tile(EBImage::combine(tumour_imgs_resized[1:40]))
+immune_grid = tile(EBImage::combine(immune_imgs_resized[1:40]))
+
+# combine grids (10px apart)
+combined <- abind(tumour_grid, 
+                 array(1, dim = c(nrow(tumour_grid), 10, 3)),
+                 immune_grid, 
+                 along = 2)
+
+grid.newpage()
+
+# Remove the margin by adjusting the layout
+grid.raster(combined, interpolate = FALSE, x = 0.5, y = 0.5, width = 1, height = 1)
+
+# Add white transparent background rectangles behind the labels
+grid.rect(x = 0.25, y = 0.95, 
+          width = 0.2, height = 0.1, 
+          gp = gpar(fill = rgb(1, 1, 1, 0.5), col = NA))  # White transparent rectangle
+grid.rect(x = 0.75, y = 0.95, 
+          width = 0.2, height = 0.1, 
+          gp = gpar(fill = rgb(1, 1, 1, 0.5), col = NA))  # White transparent rectangle
+
+# Add labels
+grid.text("Tumour Cells", 
+          x = 0.25, y = 0.95, 
+          just = "center", 
+          gp = gpar(fontsize = 14, col = "black", fontface = "bold"))
+grid.text("Immune Cells", 
+          x = 0.75, y = 0.95, 
+          just = "center", 
+          gp = gpar(fontsize = 14, col = "black", fontface = "bold"))
+
+```
+
+
+---
+
+## Research Direction {background-image="https://d2jx2rerrg6sh3.cloudfront.net/images/Article_Images/ImageForArticle_2145_16375579068259097.jpg" background-size="cover" background-opacity=0.1}
+
+**Goal:** Automatically identify tumour and immune cells in H&E tissue images.
+
+**Challenge:** Find model fit for usage in clinical settings.
+
+**Approach:** Evaluate & compare 3 different classification models.
+
+---
+
+## Workflow {background-image="https://d2jx2rerrg6sh3.cloudfront.net/images/Article_Images/ImageForArticle_2145_16375579068259097.jpg" background-size="cover" background-opacity=0.1}
+
+1. **Image Data Preparation & Processing**
+2. **Model Parameters & Training**
+3. **Evaluation & Selection**
+4. **Clinical Implementation**
+
+
+```{r preprocessing, include=FALSE}
+set_all_seeds(3888)
+set.seed(3888)
+# TEST-TRAIN
+
+# spliting into train & test (train:test is 80:20)
+imgs_train = c(immune_imgs_resized[1:80], tumour_imgs_resized[1:80]) # first 80 from healthy & tumour cells (160 images)
+imgs_test = c(immune_imgs_resized[81:100], tumour_imgs_resized[81:100]) # last 20 (40 images)
+
+# define immune and tumour images 
+y_train = c(rep("Immune", 80), rep("Tumour", 80)) |> as.factor()
+y_test = c(rep("Immune", 20), rep("Tumour", 20)) |> as.factor()
+
+# train data array
+Xmat_train = abind(lapply(imgs_train, function(x) x@.Data), along = 0)
+dim(Xmat_train) # 160 train images, 50x50 pixels, RGB colour channels
+
+# test data array
+Xmat_test = abind(lapply(imgs_test, function(x) x@.Data), along = 0)
+```
+
+---
+
+## Candidate Models {background-image="https://d2jx2rerrg6sh3.cloudfront.net/images/Article_Images/ImageForArticle_2145_16375579068259097.jpg" background-size="cover" background-opacity=0.1}
+
+::: {.incremental}
+1. **Random Forest Classification**
+2. **Convolutional Neural Network**
+3. **Support Vector Machine**
+:::
+
+---
+
+## 1 - Random Forest {background-image="https://media.istockphoto.com/id/1358738588/vector/random-forest-line-icon-decision-trees-symbol.jpg?s=612x612&w=0&k=20&c=xqya_MCikpoCYDmoZG_rmD1PxvhHD-poWmrsiFY-g_g=" background-size="cover" background-opacity=0.1}
+
+
+1. **Feature Extraction (HOG)**
+2. **Dimensionality Reduction using PCA**
+3. **Random Forest Classification**
+
+
+---
+
+## 1 - Random Forest
+
+```{r rf-hog, include=FALSE}
+set_all_seeds(3888)
+set.seed(3888)
+
+# FEATURE EXTRACTION
+set.seed(3888)
+hog_features <- OpenImageR::HOG(imgs_train[[1]], 
+                               cells = 8, 
+                               orientations = 8)
+
+# extract features in train
+Xe_train = do.call(cbind, lapply(imgs_train, HOG, cells = 8, orientations = 9)) |> t()
+dim(Xe_train)
+
+# and in test
+Xe_test = do.call(cbind, lapply(imgs_test, HOG, cells = 8, orientations = 9)) |> t()
+
+# normalise feats for rf
+Xe_train = scale(Xe_train)
+Xe_test = scale(Xe_test, 
+                 center = attr(Xe_train, "scaled:center"), 
+                 scale = attr(Xe_train, "scaled:scale"))
+
+# pca!!!
+pca = prcomp(Xe_train, center = TRUE, scale. = TRUE)
+
+# i want to keep the pc that explain 95% of variance
+cum_var = cumsum(pca$sdev^2 / sum(pca$sdev^2))
+n_pcs = which(cum_var >= 0.95)[1]
+X_train_pca = pca$x[, 1:n_pcs]
+
+
+# RANDOM FOREST
+train_control = caret::trainControl(
+  method = "cv",
+  number = 10,
+  savePredictions = TRUE,
+  classProbs = TRUE
+)
+
+# train rf on pca
+rf_pca_model = caret::train(
+  x = X_train_pca,
+  y = y_train,
+  method = "rf",
+  trControl = train_control
+)
+
+# cv results
+print(rf_pca_model)
+ggplot(rf_pca_model) + theme_minimal()
+
+
+# EVALUATE
+# test data pca transofrmation
+X_test_pca = predict(pca, newdata = Xe_test)[, 1:n_pcs]
+
+# make predictions
+test_preds = predict(rf_pca_model, newdata = X_test_pca)
+rf_confMat = confusionMatrix(test_preds, y_test, positive = "Tumour")
+```
+
+
+```{r echo=FALSE, message=FALSE}
+set_all_seeds(3888)
+set.seed(3888)
+
+# what the hog doing?
+image(matrix(hog_features, nrow = 8), 
+      col = viridis::viridis(8),
+      main = "HOG Features (8 Orientations)",
+      xlab = "Cell Position", 
+      ylab = "Orientation Bin")
+```
+
+---
+
+## 1 - Random Forest
+
+```{r, echo=FALSE, message=FALSE}
+set_all_seeds(3888)
+set.seed(3888)
+
+# pca plot
+pca_plot = ggplot(data.frame(PC = 1:20, Variance = pca$sdev[1:20]^2), aes(PC, Variance)) +
+  geom_line(color = viridis(1)) + 
+  geom_point() +
+  labs(title = "PCA Variance Explained") +
+  theme_minimal()
+pca_plot
+```
+
+---
+
+## 2 - Convolutional Neural Network {background-image="https://miro.medium.com/v2/da:true/resize:fit:1200/0*vb72NzJrSMxQZ7j9" background-size="cover" background-opacity=0.1}
+
+
+1. **Automatic Feature Learning**
+2. **CNN Architecture Design**
+3. **Training Process**
+
+---
+
+## 2 - Convolutional Neural Network 
+
+```{r cnn, include=FALSE}
+set_all_seeds(3888)
+set.seed(3888)
+
+model = keras_model_sequential(input_shape = c(50, 50, 3)) |>
+  # 1st block
+  layer_conv_2d(filters = 32, kernel_size = 3, activation = NULL, padding = "same") |> # paddinf to preserve image size
+  layer_max_pooling_2d() |>
+  layer_dropout(0.2) |> # random dropout to decrease overfitting
+  
+  # 2nd block (more filters)
+  layer_conv_2d(filters = 64, kernel_size = 3, activation = NULL, padding = "same") |>
+  layer_max_pooling_2d() |>
+  layer_dropout(0.2) |>
+  
+  # classifier
+  layer_flatten() |>
+  layer_dense(128, activation = NULL) |>
+  layer_dropout(0.2) |>
+  layer_dense(1, activation = "sigmoid") # binary classification: tumour vs immune
+
+# lower learning rate (decrease loss and make cnn more precise, especially given how subtle differences are between tumour and immune cells)
+optimizer = optimizer_adam(learning_rate = 0.0001)
+
+# early stopping to prevent redundant training (stops learning when cnn stops improving)
+early_stop = callback_early_stopping(
+  monitor = "val_loss",
+  patience = 10,
+  restore_best_weights = TRUE
+)
+
+model |> compile(
+  optimizer = optimizer,
+  loss = "binary_crossentropy",
+  metrics = "accuracy"
+)
+
+
+# fit model
+batch_size = 16 # small batches for small dataset
+epochs = 20 # from trial, not much improvement in performance beyond 20
+num_images = dim(Xmat_train)[1]
+
+
+history = model |> fit(
+  x = Xmat_train,
+  y = as.numeric(y_train == "Tumour"),
+  validation_split = 0.2,
+  epochs = epochs,
+  batch_size = batch_size,
+  steps_per_epoch = num_images %/% batch_size, # 160/16 = 10 steps per epoch, for consistent exposure to training data
+  callbacks = list(early_stop),
+  shuffle = TRUE
+)
+
+# CONFUSION MATRIX
+cnn_probs = predict(model, Xmat_test)
+cnn_preds = ifelse(cnn_probs > 0.5, "Tumour", "Immune")
+cnn_preds = factor(cnn_preds, levels = levels(y_test))
+cnn_confMat = caret::confusionMatrix(factor(cnn_preds), y_test, positive = "Tumour")
+
+```
+
+```{r cnn-history, message=FALSE}
+set_all_seeds(3888)
+
+plot(history) +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "CNN Model Training History",
+    x = "Epoch",
+    y = "Metric Value"
+  ) +
+  theme_classic()
+```
+
+---
+
+## 3 - Support Vector Machine {background-image="https://miro.medium.com/v2/da:true/resize:fit:1200/0*vb72NzJrSMxQZ7j9" background-size="cover" background-opacity=0.1}
+
+1. **Convert to Grayscale**
+2. **Feature Extraction**
+3. **SVM Classification**
+4. **Optimizationm using CV**
+
+---
+
+## 3 - Support Vector Machine
+
+
+```{r svm-pca, include=FALSE}
+set_all_seeds(3888)
+set.seed(3888)
+# function to convert images to grayscale and extract hog feats
+extract_hog_feats = function(img) {
+  set.seed(3888)
+  gray_img = channel(img, "gray")@.Data
+  
+  OpenImageR::HOG(gray_img,
+                  cells = 8,
+                  orientations = 8)
+}
+
+# pca!!!
+
+X_train_hog = t(sapply(imgs_train, extract_hog_feats))
+X_test_hog = t(sapply(imgs_test, extract_hog_feats))
+
+X_train_hog_scaled = scale(X_train_hog)
+X_test_hog_scaled = scale(X_test_hog, 
+                          center = attr(X_train_hog_scaled, "scaled:center"), 
+                          scale = attr(X_train_hog_scaled, "scaled:scale"))
+
+pca = prcomp(X_train_hog_scaled, center = TRUE, scale. = TRUE)
+
+# retain pcs that explain 95% of variance (just like earlier)
+cum_var = cumsum(pca$sdev^2 / sum(pca$sdev^2))
+n_pcs = which(cum_var >= 0.95)[1]
+X_train_pca = pca$x[, 1:n_pcs]
+
+# transform test set into same PC space
+X_test_pca = predict(pca, newdata = X_test_hog_scaled)[, 1:n_pcs]
+
+# train
+ctrl = caret::trainControl(method = "cv", number = 10)
+
+svm_cv_model = caret::train(
+  x = X_train_pca, 
+  y = y_train,
+  method = "svmRadial",
+  trControl = ctrl,
+  preProcess = NULL,  # already did manually
+  tuneLength = 3
+) 
+
+# predict
+y_pred_svm = predict(svm_cv_model, X_test_pca)
+
+# confmat
+svm_confMat = caret::confusionMatrix(y_pred_svm, y_test, positive = "Tumour")
+
+# Output
+svm_cv_model$results
+svm_cv_model$bestTune
+svm_confMat
+
+```
+
+```{r svm-plot, echo=FALSE, message=FALSE}
+set_all_seeds(3888)
+set.seed(3888)
+
+# svm decision boundary plot (2d rep)
+pca_svm <- prcomp(X_train_hog, scale. = TRUE)
+plot_data <- data.frame(PC1 = pca_svm$x[,1], PC2 = pca_svm$x[,2], Class = y_train)
+
+ggplot(plot_data, aes(PC1, PC2, color = Class)) +
+  geom_point(alpha = 0.6) +
+  stat_ellipse(level = 0.95) +
+  scale_color_viridis_d() +
+  labs(title = "SVM Classification (PCA Projection)",
+       x = "Principal Component 1",
+       y = "Principal Component 2") +
+  theme_minimal()
+```
+
+---
+
+## Evaluating Candidate Models
+
+```{r model-comp, echo=FALSE}
+set_all_seeds(3888)
+set.seed(3888)
+
+conf_mats = list(
+  "RF" = rf_confMat,
+  "CNN" = cnn_confMat,
+  "SVM" = svm_confMat
+)
+
+# key metrics
+metrics_table = purrr::map_dfr(conf_mats, ~{
+  data.frame(
+    Accuracy = .x$overall["Accuracy"],
+    Sensitivity = .x$byClass["Sensitivity"],
+    Specificity = .x$byClass["Specificity"],
+    PPV = .x$byClass["Pos Pred Value"],  
+    NPV = .x$byClass["Neg Pred Value"]   
+  )
+}, .id = "Model")
+
+# table
+# metrics_table |>
+#   arrange(desc(Accuracy)) |>
+#   kable(digits = 3, align = "c", caption = "Comparing Performance of Models", row.names = FALSE)
+
+
+# make metrics percentages
+metrics_table[, -1] = round(metrics_table[, -1] * 100, 1)  # exclude model column
+
+
+metrics_long = metrics_table |> 
+  pivot_longer(-Model, names_to = "Metric", values_to = "Value") |>
+  mutate(Metric = factor(Metric, 
+                        levels = c("Accuracy", "Sensitivity", "Specificity", "PPV", "NPV")))
+
+ggplot(metrics_long, aes(x = Metric, y = Value, fill = Model)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = round(Value, 3)), 
+            position = position_dodge(width = 0.8), 
+            vjust = -0.5, 
+            size = 3.5) +
+  scale_fill_viridis(discrete = TRUE, option = "D") +
+  labs(title = "Model Performance Comparison",
+       x = "Performance Metric",
+       y = "Score (%)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    legend.position = "top",
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  ylim(0, 1.05 * max(metrics_long$Value))  
+```
+
+---
+
+## Preferred Model - CNN {background-image="https://d2jx2rerrg6sh3.cloudfront.net/images/Article_Images/ImageForArticle_2145_16375579068259097.jpg" background-size="cover" background-opacity=0.1}
+
+**Outperformed Other Models**
+
+**High Sensitivity (95%):** High detection of tumour cells.
+
+**End-to-End Learning** - No need to extract or select features
+
+**Automatic Feature Extraction** - Finds more subtle image patterns hierarchically
+
+**Scalability** - Can handle larger datasets with more cell types
+
+---
+
+## Limitations {background-image="https://d2jx2rerrg6sh3.cloudfront.net/images/Article_Images/ImageForArticle_2145_16375579068259097.jpg" background-size="cover" background-opacity=0.1}
+
+  - Large data requirements
+
+  - CNN "Black box" blurs interpretability
+
+  - More computationally expensive than RF and SVM
+
+  - Prone to over-fitting
+
+---
+
+## Takeaway {background-image="https://d2jx2rerrg6sh3.cloudfront.net/images/Article_Images/ImageForArticle_2145_16375579068259097.jpg" background-size="cover" background-opacity=0.1}
+
+- **Clinical Implications:** CNN had the best sensitivity to tumour cells.
+
+- **Professional Interpretation:** Positive test results must be carefully examined by pathologists.
+
+- **Future Direction:** Look at classifying other cell types, examining other tissue and using different imaging systems
+
+
+---
+
+## References {.smaller} 
+
+```{r, include=FALSE, message=FALSE}
+knitr::write_bib(c(.packages(),
+                   "EBImage", "tidyverse","randomForest", "tidyverse", "viridis",
+                   "plotly", "OpenImageR", "class", "keras3", "abind", "tensorflow", "e1071", "ggplot2", "OpenImageR", "grid"), "refs.bib")
+```
+
+ChatGPT (*OpenAI*, 2023) was used for assistance in preparing this presentation template, debugging and searching for additional packages for models.
+
